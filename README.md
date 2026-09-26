@@ -38,20 +38,26 @@ GPIO15 (`XTAL_32K_P`) не переконфигурируется, sleep-реж�
 ## Сборка (в контейнере `opencode-docker/esp32`)
 
 ```bash
-pio run                 # env x4c по умолчанию
-pio run -e x4c          # явно
+scripts/build_offline.sh   # офлайн-сборка без доступа к сети (см. ниже)
+pio run                    # обычная сборка (сеть не требуется, все пакеты предустановлены)
+pio run -e x4c             # явно
 ```
 
 Артефакты: `.pio/build/x4c/firmware.bin`, `firmware.elf`,
 `bootloader.bin`, `partitions.bin`.
 
-**Важно:** в контейнере предустановлены только платформа
-`espressif32 @ 55.03.37` и toolchain (`tool-esp_install @ 5.3.4`).
-Arduino core (`framework-arduinoespressif32` 3.3.7 + `framework-arduinoespressif32-libs`,
-итого ~300 МБ с GitHub) **не предустановлен**: первый `pio run` скачает его
-автоматически. Скачивание не разрешено на этапе подготовки — сборка не
-выполнена, запуск возможен после явного разрешения (или с офлайн-архивом
-пакетов). Проверка сборки — открытый пункт в `REPORT.md`.
+**Офлайн-сборка.** Все нужные пакеты предустановлены
+(`~/.platformio/packages`: pioarduino 55.03.37, Arduino core 3.3.7 +
+`-libs` 5.5.0, toolchain 14.2.0, esptoolpy 5.1.2), но у платформы
+pioarduino 55.03.37 есть баг проверки Python-зависимостей penv
+(`penv_setup.py` ищет дистрибутив с именем `platformio`, а форк ставит тот
+же код под именем `pioarduino-core`): без сети `pio run` падает, при наличии
+сети — каждый раз безуспешно тянет zip по URL. `scripts/build_offline.sh`
+создаёт оверлей-копию платформы в `/tmp/pio-platforms` с однострочным
+фиксом matcher'а и запускает сборку с мёртвым прокси + `UV_OFFLINE=1` —
+любая попытка неявной загрузки мгновенно видна как ошибка. Оригинальный
+`~/.platformio` не изменяется. Без сети работает и `pio run`, и
+`scripts/build_offline.sh`; отличия см. `REPORT.md`.
 
 ## Процедура прошивки (первая аппаратная диагностика)
 

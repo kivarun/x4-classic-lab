@@ -19,8 +19,8 @@ sdk_sha = git(["submodule", "status", "freeink-sdk"]).split()[0][:12]
 
 env.Append(
     CPPDEFINES=[
-        ("FIRMWARE_VERSION", '"%s"' % firmware_version),
-        ("FREEINK_SDK_SHA", '"%s"' % sdk_sha),
+        ("FIRMWARE_VERSION", '\\"%s\\"' % firmware_version),
+        ("FREEINK_SDK_SHA", '\\"%s\\"' % sdk_sha),
     ]
 )
 
