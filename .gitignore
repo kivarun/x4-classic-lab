@@ -1,0 +1,4 @@
+.pio/
+.pioenvs/
+.vscode/
+*.gcode
