@@ -7,35 +7,69 @@
 
 | Артефакт | Значение |
 |---|---|
-| `artifacts/firmware.bin` | SHA-256 `805c71d379c4115a6dbe79dafa718d0f6bd20cd15ee7fef0e09665ef8808b832`, 357 104 байт |
+| `firmware.bin` | SHA-256 `805c71d379c4115a6dbe79dafa718d0f6bd20cd15ee7fef0e09665ef8808b832`, 357 104 байт |
 | `firmware.elf` | с символами для отладки/addr2line |
 | `bootloader.bin`, `partitions.bin` | **НЕ прошивать** (см. «Исключения») |
 | Коммит прошивки | `a1caced` (FreeInk SDK `5deb923c33d9`) |
 | Образ | ESP32-S3, DIO / 80 МГц / 16 MB, MMU page 64 KB, min chip rev v0.0, secure version 0, IDF `v5.5.2-729-g87912cd291` |
 
-## Заводские факты (сняты с дампа, зафиксированы ранее)
+Артефакты лежат в `/exchange/outbox/x4c-classic-diag/artifacts/`. Перед стартом
+оператор копирует `firmware.bin` в свой рабочий каталог и сверяет SHA-256
+(шаг 1 Фазы 0).
+
+## Пути (определить один раз, все команды — только через них)
+
+```sh
+WORK=/путь/к/операторскому-каталогу    # mkdir -p $WORK; cd $WORK — все дампы и артефакты живут здесь
+REPO=/путь/к/клону/x4-classic-lab      # клон репозитория с процедурой
+SCRIPT=$REPO/scripts/decode_otadata.py # декодер otadata
+FW=$WORK/firmware.bin                  # diag-образ (копия из artifacts/), НЕ $REPO-относительный путь
+FACTORY_DUMP=$WORK/factory_dump.bin    # полный заводской дамп Flash (16 MB, 16 777 216 байт)
+PORT=/dev/ttyACM0                      # USB-порт устройства
+```
+
+Пути в командах ниже — только через эти переменные. Относительные пути
+(`artifacts/firmware.bin`, `scripts/decode_otadata.py`) в командах не
+использовать: рабочий каталог оператора и каталог репозитория — разные
+каталоги.
+
+## Заводские факты (сняты с дампа, переподтверждены исправленным декодером)
 
 - Разметка 16 MB dual-OTA: `nvs@0x9000` (20 KB), `otadata@0xE000` (8 KB),
   `app0@0x10000` (8064 KB), `app1@0x7F0000` (8064 KB), `spiffs@0xFD0000`,
   `coredump@0xFE4000`. Фабричного app-раздела factory **нет**.
-- `otadata`: **две записи, seq=1 и seq=2, обе с корректными CRC, обе VALID**.
-  На момент дампа активна **seq=2 → app1**.
+- `otadata`: две записи, обе проходят проверку подтверждённым алгоритмом
+  ESP-IDF (`esp_ota_select_entry_t`, 32 байта; CRC32 =
+  `esp_rom_crc32_le(0xFFFFFFFF, &ota_seq, 4)`):
+  - сектор 0xE000: seq=1 → app0, `ota_state=VALID(0x2)`, CRC stored `0x4743989A` ✓;
+  - сектор 0xF000: seq=2 → app1, `ota_state=VALID(0x2)`, CRC stored `0x55F63774` ✓;
+  - активна **seq=2 → app1**; цель erase для переключения — **0xF000**.
+  Контрольные CRC получены независимо (отдельная C-реализация ROM-семантики
+  CRC32, не используемый в декодере код) и совпали с заводскими байтами.
 - Полный **заводской дамп Flash сохранён отдельно** — обязателен для
   отката. Без него процедуру не начинать.
+- Контрольные SHA-256 срезов заводского дампа (оператор сверяет свои
+  срезы — расхождение означает, что дамп другой или повреждён):
+
+  | Срез | Команда `dd` | SHA-256 |
+  |---|---|---|
+  | otadata (0xE000, 8 KB) | `bs=4k skip=14 count=2` | `b7e293bb607d3bddb99b7f38a7a45afd5823c0c61e3216e67858bbc759535282` |
+  | app0 (0x10000, 8064 KB) | `bs=64k skip=1 count=126` | `45a21d41c8933df1eb763a30f33673fb974b879abe989a1e272510fef9a8ec16` |
+  | app1 (0x7F0000, 8064 KB) | `bs=64k skip=127 count=126` | `57f29c2c40c98baeb3bd668ea7975cff5ae8afa989ff05cd6c15c045724795fd` |
 
 ## Механизм переключения (почему только erase, без записи otadata)
 
 Bootloader выбирает из otadata запись с максимальным `seq` среди валидных
-(CRC/seq ≠ 0xFFFFFFFF); слот = `(seq − 1) % 2`: seq=1 → `app0`, seq=2 → `app1`.
+(валидность: `ota_seq ≠ 0xFFFFFFFF`, `ota_state ∉ {INVALID(0x3), ABORTED(0x4)}`,
+CRC совпадает); слот = `(seq − 1) % 2`: seq=1 → `app0`, seq=2 → `app1`.
 
 Стёрть сектор с seq=2 → остаётся единственная валидная запись seq=1 → bootloader
 выбирает **app0**. Новый образ otadata **не записывается вообще**: не задействуются
-ни алгоритм CRC, ни раскладка записи (IDF 5.5: 32 байта `ota_seq`/`seq_label[20]`/
-`ota_state`/CRC-over-seq; легаси-IDF: 40 байт `ota_seq`/`ota_hash[32]`/CRC-over-36 —
-заводской bootloader читает свои заводские байты без изменений). Откат — точная
-перезапись стёртого сектора и `app0` из дампов. Проверку CRC делает
-`scripts/decode_otadata.py` (zlib.crc32 ≡ `esp_rom_crc32_le`; обе раскладки
-распознаются автоматически).
+ни алгоритм CRC, ни раскладка записи, заводской bootloader читает свои заводские
+байты без изменений. Откат — точная перезапись стёртого сектора и `app0` из дампов.
+Проверку CRC делает `scripts/decode_otadata.py` (формат подтверждён по исходникам
+ESP-IDF v4.4.7/v5.2.2 и дизассемблированию `libbootloader_support.a` IDF 5.5;
+легаси-лэйаут «40 байт» из прежней редакции не существует — удалён).
 
 ## Затрагиваемые области (единственные)
 
@@ -60,81 +94,111 @@ USB-порт — ESP32-S3 native (USB-Serial-JTAG, D−/D+ = GPIO19/20).
 
 ## Фаза 0 — префлайт и дампы (только чтение)
 
-Рабочий каталог оператора: `mkdir x4c-flash && cd x4c-flash`; PORT = `/dev/ttyACM0`
-(или `esptool.py chip-id` с автоопределением).
+Все чтения флеша — с `--no-stub` (ROM-путь без загрузчика-стаба: резервные
+дампы и все хэш-сверки получаются единственным детерминированным способом;
+ROM-чтение 8 MB занимает несколько минут — это норма).
 
-1. `esptool.py --chip esp32s3 --port $PORT flash-id`
+1. Подготовка артефактов и сверка диагностического бинарника:
+   `cp /exchange/outbox/x4c-classic-diag/artifacts/firmware.bin $FW` (или
+   получить артефакты из места, согласованном с отчётом), затем
+   `sha256sum $FW` — обязано быть
+   `805c71d379c4115a6dbe79dafa718d0f6bd20cd15ee7fef0e09665ef8808b832`
+   (357 104 байт). Несовпадение: СТОП (чужой/повреждённый образ).
+2. `esptool.py --chip esp32s3 --port $PORT flash-id`
    → размер флеша должен быть **16 MB**; `chip-id` → ESP32-S3.
    Иначе: СТОП (не та флеш/плата).
-2. `esptool.py --chip esp32s3 --port $PORT get-security-info`
+3. `esptool.py --chip esp32s3 --port $PORT get-security-info`
    → flash encryption и secure boot должны быть **disabled**. Иначе: СТОП
    (чтение/запись будут шифрованными; диагностический образ несовместим).
-3. Дамп текущего otadata:
-   `esptool.py --chip esp32s3 --port $PORT --after no-reset read-flash 0xE000 0x2000 otadata_before.bin`
-4. Дамп текущего app0 (≈8.26 MB, несколько минут):
-   `esptool.py --chip esp32s3 --port $PORT --after no-reset read-flash 0x10000 0x7E0000 app0_before.bin`
-5. Контроль соответствия заводскому дампу (дамп ≠ записям на устройстве → СТОП,
+4. Дамп текущего otadata (резерв):
+   `esptool.py --chip esp32s3 --port $PORT --no-stub --after no-reset read-flash 0xE000 0x2000 otadata_before.bin`
+5. Дамп текущего app0 (резерв; ≈8.26 MB, несколько минут):
+   `esptool.py --chip esp32s3 --port $PORT --no-stub --after no-reset read-flash 0x10000 0x7E0000 app0_before.bin`
+6. Контроль соответствия заводскому дампу (дамп ≠ записям на устройстве → СТОП,
    состояние ушло с момента дампа — откат из дампа был бы неточным):
-   - otadata: `dd if=factory_dump.bin of=otadata_factory.bin bs=4k skip=14 count=2`
-     (0xE000 = 56 KiB), затем `sha256sum otadata_before.bin otadata_factory.bin`;
-   - app0: `dd if=factory_dump.bin of=app0_factory.bin bs=64k skip=1 count=126`
-     (срез 0x10000, 8 064 KiB), затем `sha256sum app0_before.bin app0_factory.bin`.
-   Хэши обязаны совпасть попарно. Несовпадение хотя бы одного: СТОП, обсудить
-   с инженером.
-6. Декодирование и валидация otadata:
-   `python3 scripts/decode_otadata.py otadata_before.bin`
-   Ожидается: обе записи **VALID**, seq=1 → app0, seq=2 → app1, ACTIVE = seq=2 → app1,
-   и строка `TO BOOT APP0: erase sector @ 0x0?000` — запомнить её офсет как `$SEQ2`.
+   - срезы из заводского дампа:
+     `dd if=$FACTORY_DUMP of=otadata_factory.bin bs=4k skip=14 count=2`,
+     `dd if=$FACTORY_DUMP of=app0_factory.bin bs=64k skip=1 count=126`,
+     затем `sha256sum otadata_factory.bin app0_factory.bin` — сверить с
+     контрольными хэшами из таблицы выше (целостность самого дампа);
+   - устройство: `sha256sum otadata_before.bin app0_before.bin` — обязаны
+     совпасть с хэшами срезов попарно. Несовпадение хотя бы одного: СТОП,
+     обсудить с инженером.
+7. Декодирование и валидация otadata:
+   `python3 $SCRIPT otadata_before.bin`
+   Ожидается: обе записи **VALID**, seq=1 → app0 (CRC `0x4743989A`), seq=2 → app1
+   (CRC `0x55F63774`), ACTIVE = seq=2 → app1, и строка
+   `TO BOOT APP0: erase sector @ 0x0?000` — запомнить её офсет как `$SEQ2`
+   (по заводским фактам это `0xF000`).
    Любое иное состояние (нет валидных, единственная валидная ≠ seq=1, seq-значения
-   другие, CRC-ошибки): СТОП.
+   другие, CRC-ошибки, `ota_state` ≠ VALID): СТОП.
 
 ## Фаза 1 — совместимость с заводским bootloader (только чтение)
 
 Bootloader и таблица разделов в этой процедуре **не заменяются**. Совместимость
 проверяется сравнением заголовков образов (тот же формат, что bootloader уже
-загружает):
+загружает). Для анализа используется **полный образ заводского app1**,
+извлечённый из `$FACTORY_DUMP` (не усечённый 4 KB-слайс: `image-info` на
+усечённом файле предупреждает о нехватке сегментов и не может провалидировать
+контрольную сумму образа).
 
-7. Заголовок заводского приложения (app1) — 4 KB чтение:
-   `esptool.py --chip esp32s3 --port $PORT --after no-reset read-flash 0x7F0000 0x1000 app1_header.bin`
-8. `esptool.py image-info app1_header.bin` и `esptool.py image-info artifacts/firmware.bin`
-   — сверить поля ESP32-S3 Image/Extended Header:
-   - Image version — должен совпадать (у diag: `1`);
-   - Flash mode/size/freq — у diag: DIO / 16 MB / 80 m; у заводского — совпадающий
-     режим (если заводское приложение собрано под иной режим — СТОП);
-   - Chip ID — 9 (ESP32-S3) у обоих;
-   - Minimal/Maximal chip revision — у diag v0.0…v655.35 (совместимо с любым чипом);
-   - **MMU page size** — у diag **64 KB**; если заводское приложение заявляет
-     иную страницу — СТОП (bootloader может принудительно проверять страницу
-     MMU, раскладка маппинга не гарантирована);
-   - eFuse block revision в диапазоне diag (0.0–1.99).
-   Несовпадение какого-либо поля: СТОП — дальнейшие проверки (анализ заводского
-   bootloader-образа, его версии IDF, решения о замене bootloader'а) — вне этой
-   процедуры, требуются отдельное согласование и заводской дамп.
+8. Извлечь полный app1 из заводского дампа и сверить его целостность:
+   `dd if=$FACTORY_DUMP of=app1_factory.bin bs=64k skip=127 count=126`
+   (0x7F0000, 8 064 KB), затем
+   `sha256sum app1_factory.bin` — обязано быть
+   `57f29c2c40c98baeb3bd668ea7975cff5ae8afa989ff05cd6c15c045724795fd`.
+9. Проверка соответствия текущему устройству (полное чтение app1, несколько
+   минут):
+   `esptool.py --chip esp32s3 --port $PORT --no-stub --after no-reset read-flash 0x7F0000 0x7E0000 app1_device.bin`
+   затем `sha256sum app1_device.bin app1_factory.bin` — хэши обязаны совпасть
+   (на устройстве именно тот образ, что в дампе; иначе дрейф — СТОП).
+10. `esptool.py image-info $WORK/app1_factory.bin` и
+    `esptool.py image-info $FW` — сверить поля ESP32-S3 Image/Extended Header:
 
-   Примечание: `esptool image-info` на усечённом 4 KB-слайсе может предупреждать
-   о нехватке данных сегментов — поля заголовков при этом выводятся корректно.
+    | Поле | Диагностический образ (по факту сборки) | Требование к заводскому |
+    |---|---|---|
+    | Image version | 1 | совпадать (факт: 1) |
+    | Flash mode/size/freq | DIO / 16 MB / 80 m | совпадать |
+    | Chip ID | 9 (ESP32-S3) | 9 |
+    | Min/Max chip revision | v0.0 … v655.35 | внутри диапазона diag (факт: v0.0 … v655.35) |
+    | eFuse block revision | 0.0–1.99 | внутри диапазона diag |
+    | **MMU page size** | **64 KB** | совпадать (иное — СТОП) |
+    | Secure version | 0 | совпадать |
+
+    Несовпадение какого-либо поля: СТОП — дальнейшие проверки (анализ заводского
+    bootloader-образа, его версии IDF, решения о замене bootloader'а) — вне этой
+    процедуры, требуются отдельное согласование и заводской дамп.
+
+    Справочно (заводской app1 из дампа): проект `arduino-lib-builder`,
+    версия `idf-master-106-gc9c8a06-dirty`, IDF v5.5.4 — формат otadata с
+    `ota_state` подтверждается.
 
 ## Фаза 2 — запись diag в неактивный app0
 
-9. Запись (esptool всегда сам делает MD5-верификацию записанного; параметры
-   заголовка по умолчанию `keep` — образ пишется байт-в-байт):
-   `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset write-flash 0x10000 artifacts/firmware.bin`
-10. Явная проверка записанного:
-    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset verify-flash 0x10000 artifacts/firmware.bin`
-11. Убедиться, что otadata не изменился:
-    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_check1.bin && sha256sum otadata_check1.bin otadata_before.bin`
+11. Перед записью — контрольная сверка бинарника (обязательна непосредственно
+    перед `write-flash`):
+    `sha256sum $FW` — обязано быть
+    `805c71d379c4115a6dbe79dafa718d0f6bd20cd15ee7fef0e09665ef8808b832`.
+    Несовпадение: СТОП (образ повреждён/подменён между Фазой 0 и записью).
+12. Запись (esptool всегда сам делает MD5-верификацию записанного; параметры
+    заголовка по умолчанию `keep` — образ пишется байт-в-байт):
+    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset write-flash 0x10000 $FW`
+13. Явная проверка записанного:
+    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset verify-flash 0x10000 $FW`
+14. Убедиться, что otadata не изменился:
+    `esptool.py --chip esp32s3 --port $PORT --no-stub --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_check1.bin && sha256sum otadata_check1.bin otadata_before.bin`
     Хэши обязаны совпасть. Иначе: СТОП.
 
 ## Фаза 3 — контролируемое переключение и загрузка
 
-12. Стёрть сектор otadata с seq=2 (офсет `$SEQ2` из шага 6):
+15. Стёрть сектор otadata с seq=2 (офсет `$SEQ2` из шага 7):
     `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset erase-region $SEQ2 0x1000`
-13. Проверить итоговое состояние otadata:
-    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_switched.bin`
-    `python3 scripts/decode_otadata.py otadata_switched.bin`
+16. Проверить итоговое состояние otadata:
+    `esptool.py --chip esp32s3 --port $PORT --no-stub --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_switched.bin`
+    `python3 $SCRIPT otadata_switched.bin`
     Ожидается: одна VALID запись seq=1 → app0, сектор `$SEQ2` = erased.
     Любое иное: откат (Фаза 4) без загрузки.
-14. Загрузка diag: переткнуть USB (аппаратный reset) — или
+17. Загрузка diag: переткнуть USB (аппаратный reset) — или
     `esptool.py --chip esp32s3 --port $PORT --before no-reset run`.
     Сразу открыть монитор: `pio device monitor --port $PORT 115200`
     (из каталога репозитория; прошивка ждёт подключения CDC до 8 с — баннер не потеряется).
@@ -152,25 +216,28 @@ Bootloader и таблица разделов в этой процедуре **�
 
 ## Фаза 4 — точный откат (выполняется всегда после диагностики)
 
-15. Восстановить app0 целиком:
+18. Восстановить app0 целиком:
     `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset write-flash 0x10000 app0_before.bin`
-16. Восстановить оба сектора otadata (байт-в-байт заводское состояние):
+19. Восстановить оба сектора otadata (байт-в-байт заводское состояние):
     `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset write-flash 0xE000 otadata_before.bin`
-17. Финальная проверка отката:
-    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_after.bin`
-    `esptool.py --chip esp32s3 --port $PORT --before no-reset --after no-reset read-flash 0x10000 0x7E0000 app0_after.bin`
+20. Финальная проверка отката:
+    `esptool.py --chip esp32s3 --port $PORT --no-stub --before no-reset --after no-reset read-flash 0xE000 0x2000 otadata_after.bin`
+    `esptool.py --chip esp32s3 --port $PORT --no-stub --before no-reset --after no-reset read-flash 0x10000 0x7E0000 app0_after.bin`
     `sha256sum otadata_after.bin otadata_before.bin app0_after.bin app0_before.bin`
-    Хэши обязаны совпасть попарно. `python3 scripts/decode_otadata.py otadata_after.bin`
+    Хэши обязаны совпасть попарно. `python3 $SCRIPT otadata_after.bin`
     → снова seq=1 и seq=2 VALID, ACTIVE seq=2 → app1.
-18. Переткнуть USB → устройство возвращается в заводское состояние
+21. Переткнуть USB → устройство возвращается в заводское состояние
     (загружается app1). Подтвердить визуально работой штатной прошивки.
 
 ## СТОП-условия (остановиться и доложить)
 
 - Нет полного заводского дампа Flash до начала.
+- SHA-256 `$FW` не равен ожидаемому (шаги 1 и 11).
 - `flash-id`/`chip-id` не 16 MB/ESP32-S3; encryption/secure boot включены.
+- Срезы заводского дампа не совпали с контрольными SHA-256 (дамп другой/повреждён).
 - Дрейф: текущие otadata/app0 не совпадают с заводским дампом.
-- Декодер видит состояние, отличное от «seq=1 + seq=2, обе VALID, активна app1».
+- Декодер видит состояние, отличное от «seq=1 + seq=2, обе VALID с CRC
+  `0x4743989A`/`0x55F63774`, активна app1».
 - Несовпадение полей заголовков образов в Фазе 1 (особенно MMU page size).
 - Отсутствие баннера diag при загрузке из app0 (после отката).
 - Любое несовпадение хэшей при записи/откате.

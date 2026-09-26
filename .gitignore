@@ -1,4 +1,5 @@
 .pio/
 .pioenvs/
 .vscode/
+__pycache__/
 *.gcode
