@@ -286,6 +286,13 @@ static bool initClkoutProbe() {
 
     pcnt_chan_config_t ccfg = {};
     ccfg.edge_gpio_num = CLKOUT_PROBE_GPIO;
+    // M2 P1: level input is VIRTUAL (level_gpio_num < 0). Zero-init would have
+    // left 0 here and the driver treats it as GPIO0 - a boot strapping pin -
+    // enabling a pull-up on it (pcnt_new_channel calls gpio_pullup_en on the
+    // level pin). With -1 the driver's GPIO branch for the level input is
+    // skipped entirely and only the edge pin (GPIO15) is configured.
+    ccfg.level_gpio_num = -1;
+    ccfg.flags.virt_level_io_level = 0;  // constant low level into control_sig
     err = pcnt_new_channel(sClkUnit, &ccfg, &sClkChan);
     if (err != ESP_OK) {
         Serial.printf("clkout:    ERROR: pcnt_new_channel failed (%d)\n", (int)err);
@@ -305,6 +312,16 @@ static bool initClkoutProbe() {
                                        PCNT_CHANNEL_EDGE_ACTION_INCREASE);
     if (err != ESP_OK) {
         Serial.printf("clkout:    ERROR: edge action failed (%d)\n", (int)err);
+        return false;
+    }
+    // M2 P1: explicit KEEP for both control-level states - the counting mode
+    // driven by the edge actions must never be altered by the (virtual,
+    // constant) level input.
+    err = pcnt_channel_set_level_action(sClkChan,
+                                        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                        PCNT_CHANNEL_LEVEL_ACTION_KEEP);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: level action failed (%d)\n", (int)err);
         return false;
     }
 
@@ -395,13 +412,26 @@ void setup() {
 
     // M2: passive RTC CLKOUT probe on GPIO15 (bounded setup burst; the 2 s
     // heartbeat loop below starts right after and is never blocked by it).
+    // M2 P1 regression check: GPIO0 is the boot strapping pin; its IO MUX pad
+    // register must be byte-identical before and after the whole PCNT setup
+    // (a zero-initialized level_gpio_num would have made the driver touch it).
     Serial.printf("[mark] clkout: begin t=%lu ms\n", (unsigned long)millis());
-    if (initClkoutProbe()) {
+    const uint32_t gpio0MuxBefore = REG_READ(IO_MUX_GPIO0_REG);
+    bool clkoutOk = initClkoutProbe();
+    if (clkoutOk) {
         for (int w = 1; w <= CLKOUT_WINDOWS; ++w) {
             measureClkoutWindow(w);
         }
         Serial.printf("clkout:    reference: 32768 Hz square => %d edge counts per %u ms window\n",
                       (int)(32768 * 2 * CLKOUT_WINDOW_MS / 1000), (unsigned)CLKOUT_WINDOW_MS);
+    }
+    const uint32_t gpio0MuxAfter = REG_READ(IO_MUX_GPIO0_REG);
+    if (gpio0MuxBefore == gpio0MuxAfter) {
+        Serial.printf("gpio0:      OK: IO_MUX pad unchanged by PCNT init (0x%08X), strapping pin untouched\n",
+                      (unsigned)gpio0MuxAfter);
+    } else {
+        Serial.printf("gpio0:      REGRESSION: IO_MUX pad changed by PCNT init: 0x%08X -> 0x%08X\n",
+                      (unsigned)gpio0MuxBefore, (unsigned)gpio0MuxAfter);
     }
     Serial.printf("[mark] clkout: done t=%lu ms\n", (unsigned long)millis());
 
