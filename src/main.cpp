@@ -19,6 +19,10 @@
 
 #include <BoardConfig.h>
 
+#include <driver/gpio.h>
+#include <driver/pulse_cnt.h>
+#include <soc/io_mux_reg.h>
+
 namespace {
 
 constexpr uint8_t BM8563_I2C_ADDR = 0x51;
@@ -34,6 +38,19 @@ constexpr size_t HWCDC_TX_BUFFER_SIZE = 4096;
 // diagnostics beyond it (scan worst case: 112 addresses x 50 ms < 6 s).
 constexpr uint32_t HEARTBEAT_PERIOD_MS = 2000;
 constexpr uint16_t I2C_TIMEOUT_MS = 50;
+
+// --- M2: passive RTC CLKOUT probe on GPIO15 (the XTAL_32K_P pad) ------------
+// GPIO15 is used strictly as a high-impedance digital input: no pull-up, no
+// pull-down, no output driver, no GPIO interrupts. The internal 32 kHz
+// oscillator is never touched: RTC clock source is the internal RC per the
+// pinned sdkconfig (CONFIG_RTC_CLK_SRC_INT_RC), no rtc_clk_32k_* calls are
+// made, and the BM8563 CLKOUT register stays read-only (M1).
+constexpr int CLKOUT_PROBE_GPIO = 15;
+constexpr uint32_t CLKOUT_WINDOW_MS = 100;  // short window; hardware counts edges meanwhile
+constexpr int CLKOUT_WINDOWS = 6;           // consecutive windows measured at boot
+constexpr int PCNT_LOW_LIMIT = -1;          // driver requires low_limit < 0
+constexpr int PCNT_HIGH_LIMIT = 32767;      // far above any window: reaching it = noise marker
+constexpr uint32_t CLKOUT_GLITCH_NS = 1000; // ignore pulses < 1 us (32 kHz half-period ~15.3 us)
 
 const char* resetReasonName(esp_reset_reason_t reason) {
     switch (reason) {
@@ -192,6 +209,156 @@ void runI2cDiagnostics() {
     Serial.println("bm8563:     expected factory default: 0x80 (32.768 kHz output enabled)");
 }
 
+// --- M2: passive RTC CLKOUT probe on GPIO15 (the XTAL_32K_P pad) ------------
+// PCNT counts both edges of the pin in hardware; the app only samples the
+// counter in short stop/clear/start/read windows, so raw counts never wrap in
+// normal operation (<= ~6.6k counts per 100 ms window vs limit 32767). If a
+// window reaches the limit (floating-input noise), the watch-point ISR marks
+// the window instead of the count being trusted.
+static pcnt_unit_handle_t sClkUnit = nullptr;
+static pcnt_channel_handle_t sClkChan = nullptr;
+static volatile uint32_t sClkWindowLimitHits = 0;
+
+static bool IRAM_ATTR clkoutOnWatchReach(pcnt_unit_handle_t unit,
+                                         const pcnt_watch_event_data_t *edata, void *user) {
+    (void)unit;
+    (void)edata;
+    (void)user;
+    sClkWindowLimitHits = sClkWindowLimitHits + 1;
+    return false;
+}
+
+// Strictly high-impedance digital input on the XTAL_32K_P pad: input only,
+// no pull-up, no pull-down, no output, no GPIO interrupt.
+static void clkoutPinSetHighZ() {
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << CLKOUT_PROBE_GPIO;
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io);
+}
+
+// Pull state lives in the GPIO15 IO MUX pad register (FUN_PU bit 8 / FUN_PD
+// bit 7); read back so the log shows the real pad state, not assumptions.
+static void clkoutPinReportPulls(const char* stage) {
+    const uint32_t mux = REG_READ(IO_MUX_GPIO15_REG);
+    Serial.printf("clkout:    GPIO15 pad %s: FUN_PU=%u FUN_PD=%u (1=on, off expected)\n",
+                  stage, (unsigned)((mux & FUN_PU) ? 1 : 0), (unsigned)((mux & FUN_PD) ? 1 : 0));
+}
+
+static bool initClkoutProbe() {
+    clkoutPinSetHighZ();
+    clkoutPinReportPulls("before PCNT");
+
+    pcnt_unit_config_t ucfg = {};
+    ucfg.low_limit = PCNT_LOW_LIMIT;
+    ucfg.high_limit = PCNT_HIGH_LIMIT;
+    ucfg.flags.accum_count = 0;  // per-window restart; no accumulation needed
+    esp_err_t err = pcnt_new_unit(&ucfg, &sClkUnit);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: pcnt_new_unit failed (%d)\n", (int)err);
+        return false;
+    }
+
+    pcnt_glitch_filter_config_t fcfg = {};
+    fcfg.max_glitch_ns = CLKOUT_GLITCH_NS;
+    err = pcnt_unit_set_glitch_filter(sClkUnit, &fcfg);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: glitch filter failed (%d)\n", (int)err);
+        return false;
+    }
+
+    pcnt_event_callbacks_t cbs = {};
+    cbs.on_reach = clkoutOnWatchReach;
+    err = pcnt_unit_register_event_callbacks(sClkUnit, &cbs, nullptr);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: event callbacks failed (%d)\n", (int)err);
+        return false;
+    }
+
+    err = pcnt_unit_add_watch_point(sClkUnit, PCNT_HIGH_LIMIT);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: watch point failed (%d)\n", (int)err);
+        return false;
+    }
+
+    pcnt_chan_config_t ccfg = {};
+    ccfg.edge_gpio_num = CLKOUT_PROBE_GPIO;
+    err = pcnt_new_channel(sClkUnit, &ccfg, &sClkChan);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: pcnt_new_channel failed (%d)\n", (int)err);
+        return false;
+    }
+    // The IDF pulse_cnt driver enables a pull-up on the edge input pin
+    // (pcnt_new_channel in esp_driver_pcnt/src/pulse_cnt.c does
+    // gpio_pullup_en). Strip it: the PCNT input runs over the GPIO matrix and
+    // does not need pad pulls; the pin must stay floating.
+    gpio_pullup_dis((gpio_num_t)CLKOUT_PROBE_GPIO);
+    gpio_pulldown_dis((gpio_num_t)CLKOUT_PROBE_GPIO);
+    clkoutPinReportPulls("after PCNT (stripped)");
+
+    // Count BOTH edges (rising and falling) as increments.
+    err = pcnt_channel_set_edge_action(sClkChan,
+                                       PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                       PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: edge action failed (%d)\n", (int)err);
+        return false;
+    }
+
+    err = pcnt_unit_enable(sClkUnit);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    ERROR: unit enable failed (%d)\n", (int)err);
+        return false;
+    }
+    return true;
+}
+
+// One measurement window: clear -> start -> fixed delay -> stop -> raw count.
+// duration_us is measured around the counting interval; frequency is
+// edges/s; the CLKOUT square wave has 2 edges per period => signal = edges/2.
+static void measureClkoutWindow(int window) {
+    sClkWindowLimitHits = 0;
+    esp_err_t err = pcnt_unit_clear_count(sClkUnit);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    window %d: ERROR: clear failed (%d)\n", window, (int)err);
+        return;
+    }
+    err = pcnt_unit_start(sClkUnit);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    window %d: ERROR: start failed (%d)\n", window, (int)err);
+        return;
+    }
+    const uint32_t t0 = micros();
+    delay(CLKOUT_WINDOW_MS);
+    const uint32_t t1 = micros();
+    err = pcnt_unit_stop(sClkUnit);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    window %d: ERROR: stop failed (%d)\n", window, (int)err);
+        return;
+    }
+    int counts = 0;
+    err = pcnt_unit_get_count(sClkUnit, &counts);
+    if (err != ESP_OK) {
+        Serial.printf("clkout:    window %d: ERROR: get count failed (%d)\n", window, (int)err);
+        return;
+    }
+
+    const uint32_t windowUs = t1 - t0;
+    const bool noisy = sClkWindowLimitHits != 0;
+    float edgesHz = 0.0f, signalHz = 0.0f;
+    if (windowUs > 0) {
+        edgesHz = (float)counts * 1e6f / (float)windowUs;
+        signalHz = edgesHz / 2.0f;
+    }
+    Serial.printf("clkout:    window %d: counts=%d dur=%lu us edges=%.1f Hz signal=%.1f Hz%s\n",
+                  window, counts, (unsigned long)windowUs,
+                  (double)edgesHz, (double)signalHz,
+                  noisy ? " LIMIT-REACHED (noise, untrusted)" : "");
+}
+
 }  // namespace
 
 void setup() {
@@ -226,8 +393,20 @@ void setup() {
     runI2cDiagnostics();
     Serial.printf("[mark] i2c: done t=%lu ms\n", (unsigned long)millis());
 
+    // M2: passive RTC CLKOUT probe on GPIO15 (bounded setup burst; the 2 s
+    // heartbeat loop below starts right after and is never blocked by it).
+    Serial.printf("[mark] clkout: begin t=%lu ms\n", (unsigned long)millis());
+    if (initClkoutProbe()) {
+        for (int w = 1; w <= CLKOUT_WINDOWS; ++w) {
+            measureClkoutWindow(w);
+        }
+        Serial.printf("clkout:    reference: 32768 Hz square => %d edge counts per %u ms window\n",
+                      (int)(32768 * 2 * CLKOUT_WINDOW_MS / 1000), (unsigned)CLKOUT_WINDOW_MS);
+    }
+    Serial.printf("[mark] clkout: done t=%lu ms\n", (unsigned long)millis());
+
     Serial.println();
-    Serial.println("diag done (GPIO15/XTAL_32K_P untouched, RTC read-only, no sleep, no display init)");
+    Serial.println("diag done (GPIO15 high-Z input probe only, RTC read-only, no sleep, no display init)");
     Serial.printf("[mark] loop: entering t=%lu ms\n", (unsigned long)millis());
 }
 
