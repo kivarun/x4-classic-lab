@@ -24,6 +24,17 @@ namespace {
 constexpr uint8_t BM8563_I2C_ADDR = 0x51;
 constexpr uint8_t BM8563_REG_CLKOUT = 0x0D;
 
+// M1 observability: HWCDC TX ring buffer enlarged before Serial.begin() so the
+// whole startup output survives a host that connects later (default 256 B
+// keeps only the newest bytes when full; ~1 KB of startup output would lose
+// the banner).
+constexpr size_t HWCDC_TX_BUFFER_SIZE = 4096;
+// M1 observability: heartbeat period. Wire default timeout is 50 ms per
+// transaction (Wire.cpp ctor); made explicit so a stuck I2C bus cannot stall
+// diagnostics beyond it (scan worst case: 112 addresses x 50 ms < 6 s).
+constexpr uint32_t HEARTBEAT_PERIOD_MS = 2000;
+constexpr uint16_t I2C_TIMEOUT_MS = 50;
+
 const char* resetReasonName(esp_reset_reason_t reason) {
     switch (reason) {
         case ESP_RST_UNKNOWN: return "UNKNOWN";
@@ -128,6 +139,10 @@ void runI2cDiagnostics() {
         Serial.println("i2c:        ERROR: bus init failed");
         return;
     }
+    // Explicit per-transaction timeout (Wire default is already 50 ms in this
+    // core): every endTransmission()/requestFrom() is bounded by it, so a
+    // stuck bus returns errors instead of blocking the diagnostics.
+    Wire.setTimeOut(I2C_TIMEOUT_MS);
 
     // 1) Bus scan: only START + ADDRESS probe (endTransmission with no data).
     Serial.print("i2c scan:  ");
@@ -180,12 +195,25 @@ void runI2cDiagnostics() {
 }  // namespace
 
 void setup() {
-    // USB CDC (ARDUINO_USB_MODE=1 + ARDUINO_USB_CDC_ON_BOOT=1): wait briefly for
-    // a host to attach, so the banner is not lost when monitored from reset.
+    // M1 markers: timestamps are taken before each init step; lines are printed
+    // once HWCDC accepts writes. Writes before Serial.begin() are silently
+    // dropped (tx_lock/tx_ring_buf are created inside begin()), so the pre-USB
+    // marker carries its pre-begin timestamp instead.
+    const uint32_t tUsbPre = millis();
+
+    // USB CDC (ARDUINO_USB_MODE=1 + ARDUINO_USB_CDC_ON_BOOT=1): enlarge the TX
+    // ring buffer BEFORE begin() (begin() keeps an existing buffer), then wait
+    // briefly for a host to attach, so the banner is not lost when monitored
+    // from reset.
+    Serial.setTxBufferSize(HWCDC_TX_BUFFER_SIZE);
     Serial.begin(115200);
+    Serial.printf("[mark] usb: pre-begin t=%lu ms\n", (unsigned long)tUsbPre);
+    Serial.printf("[mark] usb: begin done t=%lu ms\n", (unsigned long)millis());
     for (uint32_t start = millis(); !Serial && millis() - start < 8000;) {
         delay(10);
     }
+    Serial.printf("[mark] usb: host %s t=%lu ms\n",
+                  Serial ? "connected" : "not detected", (unsigned long)millis());
 
     printStartupBanner();
     printChipInfo();
@@ -193,16 +221,21 @@ void setup() {
     printFlashInfo();
     printPsramInfo();
     printBoardProfile();
+
+    Serial.printf("[mark] i2c: begin t=%lu ms\n", (unsigned long)millis());
     runI2cDiagnostics();
+    Serial.printf("[mark] i2c: done t=%lu ms\n", (unsigned long)millis());
 
     Serial.println();
     Serial.println("diag done (GPIO15/XTAL_32K_P untouched, RTC read-only, no sleep, no display init)");
+    Serial.printf("[mark] loop: entering t=%lu ms\n", (unsigned long)millis());
 }
 
 void loop() {
     // Keep the device powered for a human to read the output; no sleep modes.
+    // 2 s heartbeat: any capture window proves liveness quickly.
     static uint32_t last = 0;
-    if (millis() - last >= 60000) {
+    if (millis() - last >= HEARTBEAT_PERIOD_MS) {
         last = millis();
         Serial.printf("heartbeat: uptime %lu s\n", (unsigned long)(millis() / 1000));
     }
